@@ -47,6 +47,12 @@ hundreds of additional hashes and ciphers in "-jumbo" versions.
 
 See INSTALL for information on installing John on your system.
 
+	How to install systemwide
+
+./configure --with-systemwide
+make
+make install
+sudo ln -s ~/Downloads/john/run/* /usr/local/bin/.
 
 	How to use.
 
