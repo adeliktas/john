@@ -8,6 +8,9 @@
  * modification, are permitted.
  *
  * Based on opencl_pbkdf2_hmac_sha512_fmt_plug.c file.
+ *
+ * Update to implement and use on-device ed25519_publickey() and BLAKE2b for
+ * great speedup was funded by the Tezos Foundation.
  */
 
 #include "arch.h"
@@ -21,9 +24,6 @@ john_register_one(&fmt_opencl_tezos);
 
 #include <stdint.h>
 #include <string.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #include "misc.h"
 #include "common.h"
@@ -31,7 +31,6 @@ john_register_one(&fmt_opencl_tezos);
 #include "options.h"
 #include "opencl_common.h"
 #include "tezos_common.h"
-#include "blake2.h"
 #include "johnswap.h"
 #include "pbkdf2_hmac_common.h"
 
@@ -83,18 +82,14 @@ typedef struct {
 	salt_t pbkdf2;
 	uint32_t mnemonic_length;
 	unsigned char mnemonic[128];
+	unsigned char pkh[20];
 } tezos_salt_t;
 
-typedef struct {
-	unsigned char pk[32];
-} tezos_pk_t;
-
-static int *cracked;
-static int any_cracked, cracked_size;
+static uint32_t *cracked;
+static size_t cracked_size;
 static pass_t *host_pass;  /** plain ciphertexts **/
 static tezos_salt_t *host_salt;  /** salt **/
-static tezos_pk_t *host_pk;
-static cl_mem mem_in, mem_out, mem_salt, mem_state, mem_pk;
+static cl_mem mem_in, mem_out, mem_salt, mem_state, mem_final;
 static cl_kernel split_kernel, final_kernel;
 static cl_int cl_error;
 static int new_keys;
@@ -131,9 +126,8 @@ static void create_clobj(size_t kpc, struct fmt_main *self)
 
 	host_pass = mem_calloc(kpc, sizeof(pass_t));
 	host_salt = mem_calloc(1, sizeof(tezos_salt_t));
-	host_pk = mem_calloc(kpc, sizeof(tezos_pk_t));
-	cracked_size = sizeof(*cracked) * kpc;
-	cracked = mem_calloc(1, cracked_size);
+	cracked_size = sizeof(*cracked) * (1 + kpc);
+	cracked = mem_alloc(cracked_size);
 #define CL_RO CL_MEM_READ_ONLY
 #define CL_WO CL_MEM_WRITE_ONLY
 #define CL_RW CL_MEM_READ_WRITE
@@ -153,8 +147,8 @@ static void create_clobj(size_t kpc, struct fmt_main *self)
 			"Cannot allocate mem out");
 	mem_state = CLCREATEBUFFER(CL_RW, kpc * sizeof(state_t),
 			"Cannot allocate mem state");
-	mem_pk = CLCREATEBUFFER(CL_WO, kpc * sizeof(tezos_pk_t),
-			"Cannot allocate mem pk");
+	mem_final = CLCREATEBUFFER(CL_RW, cracked_size,
+			"Cannot allocate mem final");
 
 	CLKERNELARG(crypt_kernel, 0, mem_in, "Error while setting mem_in");
 	CLKERNELARG(crypt_kernel, 1, mem_salt, "Error while setting mem_salt");
@@ -164,7 +158,10 @@ static void create_clobj(size_t kpc, struct fmt_main *self)
 	CLKERNELARG(split_kernel, 1, mem_out, "Error while setting mem_out");
 
 	CLKERNELARG(final_kernel, 0, mem_out, "Error while setting mem_out");
-	CLKERNELARG(final_kernel, 1, mem_pk, "Error while setting mem_pk");
+	CLKERNELARG(final_kernel, 1, mem_salt, "Error while setting mem_salt");
+	CLKERNELARG(final_kernel, 2, mem_final, "Error while setting mem_final");
+
+	*cracked = 1; /* Trigger zeroization and transfer of cracked[] to device */
 }
 
 static void init(struct fmt_main *_self)
@@ -211,13 +208,13 @@ static void release_clobj(void)
 	if (host_pass) {
 		MEM_FREE(host_pass);
 		MEM_FREE(host_salt);
-		MEM_FREE(host_pk);
+		MEM_FREE(cracked);
 
 		HANDLE_CLERROR(clReleaseMemObject(mem_in), "Release mem in");
 		HANDLE_CLERROR(clReleaseMemObject(mem_salt), "Release mem salt");
 		HANDLE_CLERROR(clReleaseMemObject(mem_out), "Release mem out");
 		HANDLE_CLERROR(clReleaseMemObject(mem_state), "Release mem state");
-		HANDLE_CLERROR(clReleaseMemObject(mem_pk), "Release mem pk");
+		HANDLE_CLERROR(clReleaseMemObject(mem_final), "Release mem final");
 	}
 }
 
@@ -243,6 +240,7 @@ static void set_salt(void *salt)
 	host_salt->pbkdf2.rounds = ITERATIONS;
 	memcpy(host_salt->mnemonic, cur_salt->mnemonic, cur_salt->mnemonic_length);
 	host_salt->mnemonic_length = cur_salt->mnemonic_length;
+	memcpy(host_salt->pkh, cur_salt->raw_address + 2, 20);
 
 	HANDLE_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_salt,
 		CL_FALSE, 0, sizeof(tezos_salt_t), host_salt, 0, NULL, NULL),
@@ -250,53 +248,20 @@ static void set_salt(void *salt)
 	HANDLE_CLERROR(clFlush(queue[gpu_id]), "failed in clFlush");
 }
 
-#include "timer.h"
-#define WAIT_INIT(work_size) { \
-	static uint64_t wait_last_work_size; \
-	int wait_sleep = (work_size >= wait_last_work_size); \
-	wait_last_work_size = work_size; \
-	static uint64_t wait_times[20], wait_min; \
-	static unsigned int wait_index; \
-	uint64_t wait_start = 0;
-#define WAIT_SLEEP \
-	if (gpu_nvidia(device_info[gpu_id])) { \
-		wait_start = john_get_nano(); \
-		uint64_t us = wait_min >> 10; /* 2.4% less than min */ \
-		if (wait_sleep && us >= 1000) \
-			usleep(us); \
-	}
-#define WAIT_UPDATE \
-	if (gpu_nvidia(device_info[gpu_id])) { \
-		uint64_t wait_new = john_get_nano() - wait_start; \
-		if (wait_new < wait_min && wait_new < wait_min * 1000 / 1012) /* 1.2% less than min */ \
-			wait_new = wait_new * 7 / 8; /* we might have overslept and don't know by how much */ \
-		if (wait_times[wait_index] == wait_min) { /* about to replace former minimum */ \
-			unsigned int i; \
-			wait_times[wait_index] = wait_min = ~(uint64_t)0; \
-			for (i = 0; i < sizeof(wait_times) / sizeof(wait_times[0]); i++) \
-				if (wait_times[i] < wait_min) \
-					wait_min = wait_times[i]; \
-		} \
-		wait_times[wait_index++] = wait_new; \
-		if (wait_index >= sizeof(wait_times) / sizeof(wait_times[0])) \
-			wait_index = 0; \
-		if (wait_new < wait_min) \
-			wait_min = wait_new; \
-		wait_sleep = 1; \
-	}
-#define WAIT_DONE }
-
 static int crypt_all(int *pcount, struct db_salt *salt)
 {
 	const int count = *pcount;
-	int i, index;
+	int i;
 	int loops = (ITERATIONS + HASH_LOOPS - 1) / HASH_LOOPS;
 	size_t *lws = local_work_size ? &local_work_size : NULL;
 	size_t gws = GET_NEXT_MULTIPLE(count, local_work_size);
 
-	if (any_cracked) {
+	if (*cracked) {
 		memset(cracked, 0, cracked_size);
-		any_cracked = 0;
+		BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_final, CL_FALSE, 0,
+			cracked_size, cracked, 0, NULL, NULL),
+			"Initial transfer");
+		BENCH_CLERROR(clFlush(queue[gpu_id]), "failed in clFlush");
 	}
 
 	static int warned;
@@ -306,17 +271,18 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 	}
 
 	if (new_keys || ocl_autotune_running) {
-		// Copy data to gpu
 		BENCH_CLERROR(clEnqueueWriteBuffer(queue[gpu_id], mem_in, CL_FALSE, 0,
 			gws * sizeof(pass_t), host_pass, 0, NULL,
-			multi_profilingEvent[0]), "Copy data to gpu");
+			multi_profilingEvent[0]), "Keys transfer");
 		new_keys = 0;
 	}
 
-	// Run kernel
 	BENCH_CLERROR(clEnqueueNDRangeKernel(queue[gpu_id], crypt_kernel, 1,
 				NULL, &gws, lws, 0, NULL,
 				multi_profilingEvent[1]), "Run kernel");
+
+	// Better precision for WAIT_ macros
+	BENCH_CLERROR(clFinish(queue[gpu_id]), "clFinish");
 
 	WAIT_INIT(gws)
 	for (i = 0; i < (ocl_autotune_running ? 1 : loops); i++) {
@@ -335,31 +301,21 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 				final_kernel, 1, NULL,
 				&gws, (local_work_size <= final_kernel_max_lws) ? lws : NULL, 0, NULL,
 				multi_profilingEvent[3]), "Run final kernel");
-
-	// Read the result back
-	WAIT_INIT(gws)
-	WAIT_SLEEP
-	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_pk, CL_TRUE, 0,
-				gws * sizeof(tezos_pk_t), host_pk,
+	BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_final, CL_FALSE, 0,
+				sizeof(*cracked), cracked,
 				0, NULL, multi_profilingEvent[4]), "Copy result back");
+
+	WAIT_INIT(gws)
+	BENCH_CLERROR(clFlush(queue[gpu_id]), "failed in clFlush");
+	WAIT_SLEEP
+	BENCH_CLERROR(clFinish(queue[gpu_id]), "clFinish");
 	WAIT_UPDATE
 	WAIT_DONE
 
-	if (!ocl_autotune_running) {
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif
-		for (index = 0; index < count; index++) {
-			unsigned char buffer[20];
-			blake2b((uint8_t *)buffer, host_pk[index].pk, NULL, 20, 32, 0);
-			if (!memcmp(cur_salt->raw_address + 2, buffer, 20)) {
-				cracked[index] = 1;
-#ifdef _OPENMP
-#pragma omp atomic
-#endif
-				any_cracked |= 1;
-			}
-		}
+	if (*cracked) {
+		BENCH_CLERROR(clEnqueueReadBuffer(queue[gpu_id], mem_final, CL_TRUE, 0,
+					(count + 1) * sizeof(*cracked), cracked,
+					0, NULL, multi_profilingEvent[4]), "Copy result back");
 	}
 
 	return count;
@@ -367,12 +323,16 @@ static int crypt_all(int *pcount, struct db_salt *salt)
 
 static int cmp_all(void *binary, int count)
 {
-	return any_cracked;
+	return *cracked;
 }
 
 static int cmp_one(void *binary, int index)
 {
-	return cracked[index];
+	uint32_t magic = cracked[1 + index];
+	if (!magic || magic == 0x486954)
+		return magic;
+	fprintf(stderr, FORMAT_LABEL ": Cracked something, but the magic 0x%08x is bad, skipping\n", magic);
+	return 0;
 }
 
 static int cmp_exact(char *source, int index)
@@ -415,7 +375,7 @@ struct fmt_main fmt_opencl_tezos = {
 		SALT_ALIGN,
 		MIN_KEYS_PER_CRYPT,
 		MAX_KEYS_PER_CRYPT,
-		FMT_CASE | FMT_8_BIT | FMT_OMP | FMT_HUGE_INPUT,
+		FMT_CASE | FMT_8_BIT | FMT_HUGE_INPUT,
 		{ NULL },
 		{ FORMAT_TAG },
 		tezos_tests

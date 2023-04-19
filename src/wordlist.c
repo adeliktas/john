@@ -13,20 +13,21 @@
 #if AC_BUILT
 #include "autoconfig.h"
 #else
-#ifndef sparc
-#undef _POSIX_SOURCE
-#define _POSIX_SOURCE /* for fileno(3) */
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE /* for fileno(3) and stat(2) */
 #endif
 #endif
 
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 
 #if (!AC_BUILT || HAVE_UNISTD_H) && !_MSC_VER
 #include <unistd.h>
 #endif
 
+#define NEED_OS_FORK
 #include "os.h"
 
 #if !AC_BUILT
@@ -46,6 +47,7 @@
 #endif
 
 #include <errno.h>
+#include <assert.h>
 
 #include "arch.h"
 #include "mem_map.h"
@@ -65,6 +67,7 @@
 #include "rules.h"
 #include "external.h"
 #include "cracker.h"
+#include "suppressor.h"
 #include "john.h"
 #include "unicode.h"
 #include "regex.h"
@@ -506,6 +509,8 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 #endif
 
 	length = options.eff_maxlength;
+	/* Nice message about truncation to length 0 is done by other mode. */
+	assert(length > 0);
 
 	/* If we did not give a name for loopback mode,
 	   we use the active pot file */
@@ -513,7 +518,7 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 		name = options.wordlist = options.activepot;
 
 	/* These will ignore --save-memory */
-	if (loopBack || dupeCheck ||
+	if (loopBack ||
 	    (!options.max_wordfile_memory &&
 	     (options.flags & FLG_RULES_CHK)))
 		forceLoad = 1;
@@ -527,6 +532,15 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 		if (!(name = cfg_get_param(SECTION_OPTIONS, NULL, "Wordlist")))
 		if (!(name = cfg_get_param(SECTION_OPTIONS, NULL, "Wordfile")))
 			name = options.wordlist = WORDLIST_NAME;
+	}
+
+	static unsigned int prev_g;
+	static unsigned long long prev_p;
+	if (rules && cfg_get_bool(SECTION_OPTIONS, NULL, "PerRuleStats", 0) && !(options.flags & FLG_MASK_CHK) &&
+	    (!(options.flags & FLG_NOLOG) || options.log_stderr)) {
+		rules = 2;
+		prev_g = status.guess_count;
+		prev_p = status.cands;
 	}
 
 	if (((options.flags & FLG_BATCH_CHK) || rec_restored || default_wordlist) && john_main_process) {
@@ -562,6 +576,14 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 
 		file_is_fifo = ((st.st_mode & S_IFMT) == S_IFIFO);
 
+#if OS_FORK
+		if (options.fork && file_is_fifo) {
+			if (john_main_process)
+				fprintf(stderr, "Error, cannot use --fork with FIFO as wordlist file.\n");
+			error();
+		}
+#endif
+
 		if (john_main_process)
 			log_event("- %s %s: %.100s", loopBack ? "Loopback pot" : "Wordlist",
 			          file_is_fifo ? "FIFO" : "file",
@@ -578,7 +600,7 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 			            "WordlistMemoryMapMaxSize");
 
 		if (mmap_max == -1)
-			mmap_max = 1 << 20;
+			mmap_max = 1 << 10;
 #endif
 		jtr_fseek64(word_file, 0, SEEK_END);
 		if ((file_len = jtr_ftell64(word_file)) == -1)
@@ -586,8 +608,7 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 		jtr_fseek64(word_file, 0, SEEK_SET);
 		if (file_len == 0 && !loopBack) {
 			if (john_main_process)
-				fprintf(stderr, "Error, dictionary file is "
-				        "empty\n");
+				fprintf(stderr, "Error, wordlist file is empty\n");
 			error();
 		}
 
@@ -618,17 +639,23 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 			} else {
 				map_pos = mem_map;
 				map_end = mem_map + file_len;
+#if MGETL_HAS_SIMD
 				map_scan_end = map_end - VSCANSZ;
+#endif
 			}
 		}
 #endif
 
-		ourshare = options.node_count ?
-			(file_len / options.node_count) *
-			(options.node_max - options.node_min + 1)
-			: file_len;
+		ourshare = file_len;
 
-		if (ourshare < options.max_wordfile_memory &&
+		// Load only this node's share of words to memory
+		if (mem_map && options.node_count > 1 &&
+		    (file_len > options.node_count * (length * 100))) {
+			ourshare = (file_len / options.node_count) *
+				(options.node_max - options.node_min + 1);
+		}
+
+		if (ourshare <= options.max_wordfile_memory &&
 		    mem_saving_level < 2 &&
 		    (options.flags & FLG_RULES_CHK))
 			forceLoad = 1;
@@ -640,8 +667,7 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 			char *aep;
 
 			// Load only this node's share of words to memory
-			if (mem_map && options.node_count > 1 &&
-			    (file_len > options.node_count * (length * 100))) {
+			if (ourshare < file_len) {
 				/* Check net size for our share. */
 				for (nWordFileLines = 0;; ++nWordFileLines) {
 					char *lp;
@@ -773,7 +799,7 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 			if (csearch == '\n')
 				while (*cp == '\r') cp++;
 
-			if (dupeCheck) {
+			if (loopBack) {
 				hash_log = 1;
 				while (((1 << hash_log) < (nWordFileLines))
 				       && hash_log < 27)
@@ -832,7 +858,7 @@ void do_wordlist_crack(struct db_main *db, const char *name, int rules)
 					} else
 						if (ep - cp >= LINE_BUFFER_SIZE)
 							cp[LINE_BUFFER_SIZE-1] = 0;
-					if (dupeCheck) {
+					if (loopBack) {
 						/* Full suppression of dupes
 						   after truncation */
 						if (wbuf_unique(cp))
@@ -1050,11 +1076,17 @@ REDO_AFTER_LMLOOP:
 		crk_init(db, fix_state, NULL);
 	}
 
+	if (dupeCheck || rules) {
+		int force = (dupeCheck || (options.flags & FLG_STDOUT)) && options.suppressor_size;
+		suppressor_init(SUPPRESSOR_UPDATE | (force ? SUPPRESSOR_FORCE : 0));
+	}
+
 	prerule = rule = "";
 	if (rules)
 		prerule = rpp_next(&ctx);
 
 /* A string that can't be produced by fgetl(). */
+	last = aligned.buffer[1];
 	last[0] = '\n';
 	last[1] = 0;
 
@@ -1365,6 +1397,23 @@ EndOfFile:
 #endif
 		if (rules) {
 next_rule:
+			if (rules > 1 && prerule) {
+				unsigned long long p = status.cands, fake_p = 0;
+				if (!(options.flags & FLG_STDOUT)) do {
+					if (crk_direct_process_key("PerRuleStats"))
+						goto done;
+					fake_p++;
+				} while (p == status.cands);
+				unsigned int g = status.guess_count - prev_g;
+				p = status.cands - fake_p - prev_p;
+				double score = p ? (g ? (double)g * g : 1e-9) / (double)p : 0;
+				double pg = (double)(p ? p : 1e9) / (g ? g : 1e-9);
+				log_event("- Score %.18f for %.2f p/g %ug %llup during rule #%d :%.100s",
+					score, pg, g, p, rule_number + 1, prerule);
+				prev_g = status.guess_count;
+				prev_p = status.cands;
+			}
+
 			if (!(rule = rpp_next(&ctx))) break;
 			rule_number++;
 
@@ -1402,6 +1451,7 @@ next_rule:
 	if (pipe_input)
 		goto GRAB_NEXT_PIPE_LOAD;
 
+done:
 	crk_done();
 	rec_done(event_abort || (status.pass && db->salts));
 

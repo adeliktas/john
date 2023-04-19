@@ -1,10 +1,14 @@
 /*
- * This software is Copyright (c) 2018 Dhiru Kholia
+ * This software is
+ * Copyright (c) 2018 Dhiru Kholia
  * Copyright (c) 2019-2020 magnum
  * Copyright (c) 2021 Solar Designer
  * and it is hereby released to the general public under the following terms:
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted.
+ *
+ * Update to implement and use on-device ed25519_publickey() and BLAKE2b for
+ * great speedup was funded by the Tezos Foundation.
  */
 
 #include "pbkdf2_hmac_sha512_kernel.cl"
@@ -13,11 +17,8 @@ typedef struct {
 	salt_t pbkdf2;
 	uint mnemonic_length;
 	uchar mnemonic[128];
+	uchar pkh[20];
 } tezos_salt_t;
-
-typedef struct {
-	uchar pk[32];
-} tezos_pk_t;
 
 inline void _tezos_preproc_(const ulong *key, uint keylen,
                             ulong *state, ulong mask)
@@ -190,10 +191,12 @@ __kernel void pbkdf2_sha512_tezos_init(__global const pass_t *inbuffer,
 	}
 }
 
-#undef z /* was defined by opencl_sha2.h and used in SHA256_ZEROS, but conflicts with the below */
 #include "ed25519-donna/ed25519-donna.c"
+#define ROTR64 ror64 /* Reuse our SHA-512's optimized macro */
+#define B2B_ONE_BLOCK_ONLY
+#include "blake2_mjosref/blake2b.c"
 
-__kernel void pbkdf2_sha512_tezos_final(__global const crack_t *in, __global tezos_pk_t *out)
+__kernel void pbkdf2_sha512_tezos_final(__global const crack_t *in, __constant tezos_salt_t *gsalt, volatile __global uint *out)
 {
 	union {
 		uchar uc[32];
@@ -201,9 +204,13 @@ __kernel void pbkdf2_sha512_tezos_final(__global const crack_t *in, __global tez
 	} sk;
 	ed25519_public_key pk;
 	uint idx = get_global_id(0);
-	memcpy_gp(&sk, in[idx].hash, sizeof(sk));
+	memcpy_macro(sk.u64, in[idx].hash, 4);
 	for (int i = 0; i < 4; i++)
 		sk.u64[i] = SWAP64(sk.u64[i]);
 	ed25519_publickey(sk.uc, pk);
-	memcpy_pg(out[idx].pk, pk, sizeof(out[idx].pk));
+	blake2b(pk, 20, NULL, 0, pk, sizeof(pk)); /* Replace pk with pkh */
+	if (!memcmp_pc(pk, gsalt->pkh, 20)) {
+		atomic_inc(out);
+		out[idx + 1] = 0x486954;
+	}
 }

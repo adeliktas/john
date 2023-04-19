@@ -80,6 +80,7 @@ size_t ocl_max_lws;
 static char opencl_log[LOG_SIZE];
 static int opencl_initialized;
 int opencl_unavailable;
+int opencl_avoid_busy_wait[MAX_GPU_DEVICES];
 
 static void load_device_info(int sequential_id);
 static char* get_device_capability(int sequential_id);
@@ -143,10 +144,11 @@ void opencl_process_event(void)
 				rec_save();
 			}
 
-			if (event_status) {
-				event_status = 0;
-				status_print();
-			}
+			if (event_help)
+				sig_help();
+
+			if (event_status)
+				status_print(0);
 
 			if (event_ticksafety) {
 				event_ticksafety = 0;
@@ -1146,8 +1148,16 @@ static char *get_build_opts(int sequential_id, const char *opts)
 			global_opts = OPENCLBUILDOPTIONS;
 
 	snprintf(build_opts, LINE_BUFFER_SIZE,
-	         "-I opencl %s %s%s%s%s%d %s%d %s -D_OPENCL_COMPILER %s",
+	         "-I opencl %s %s%s%s%s%s%d %s%d %s -D_OPENCL_COMPILER %s",
 	        global_opts,
+	        get_device_version(sequential_id) >= 200 ? "-cl-std=CL1.2 " : "",
+#ifdef __APPLE__
+	        "-D__OS_X__ ",
+#else
+	        (options.verbosity >= VERB_MAX &&
+	         gpu_nvidia(device_info[sequential_id])) ?
+	         "-cl-nv-verbose " : "",
+#endif
 	        get_platform_vendor_id(get_platform_id(sequential_id)) ==
 	         PLATFORM_MESA ? "-D__MESA__ " :
 	        get_platform_vendor_id(get_platform_id(sequential_id)) ==
@@ -1156,13 +1166,6 @@ static char *get_build_opts(int sequential_id, const char *opts)
 	         PLATFORM_BEIGNET ?
 	         "-D__BEIGNET__ " :
 	        get_device_capability(sequential_id),
-#ifdef __APPLE__
-	        "-D__OS_X__ ",
-#else
-	        (options.verbosity >= VERB_MAX &&
-	         gpu_nvidia(device_info[sequential_id])) ?
-	         "-cl-nv-verbose " : "",
-#endif
 	        get_device_type(sequential_id) == CL_DEVICE_TYPE_CPU ? "-D__CPU__ "
 	        : get_device_type(sequential_id) == CL_DEVICE_TYPE_GPU ? "-D__GPU__ " : "",
 	        "-DDEVICE_INFO=", device_info[sequential_id],
@@ -1582,19 +1585,27 @@ static cl_ulong gws_test(size_t gws, unsigned int rounds, int sequential_id)
 		                                       NULL),
 		               "clGetEventProfilingInfo end");
 
-		/*
-		 * Work around driver bugs. Problems seen with old AMD and Apple M1.
-		 * If startTime looks b0rken we use submitTime instead
-		 */
-		if (i == main_opencl_event && (endTime - submitTime) > 10 * (endTime - startTime)) {
-			prof_bug = 1;
-
-			startTime = submitTime;
-		}
+		if (i == main_opencl_event && options.verbosity > VERB_MAX)
+			fprintf(stderr, " [%lu, %lu, %lu, %u, %d]", (unsigned long)startTime,
+			        (unsigned long)endTime, (unsigned long)submitTime, rounds, hash_loops);
 
 		/* Work around OSX bug with HD4000 driver */
 		if (endTime == 0)
 			endTime = startTime;
+
+		/*
+		 * Work around driver bugs. Problems seen with old AMD and Apple M1.
+		 * If startTime looks b0rken we use submitTime instead
+		 *
+		 * If the difference of submitTime and startTime is greater than 5s,
+		 * submitTime is b0rken
+		 */
+		if (i == main_opencl_event && (startTime - submitTime < 5000000000ULL) &&
+		   (endTime - submitTime) > 10 * (endTime - startTime)) {
+			prof_bug = 1;
+
+			startTime = submitTime;
+		}
 
 		if ((split_events) && (i == split_events[0] ||
 		                       i == split_events[1] || i == split_events[2])) {
@@ -1659,16 +1670,12 @@ void opencl_init_auto_setup(int p_default_value, int p_hash_loops,
 	ocl_autotune_db = db;
 	autotune_real_db = db && db->real && db->real == db;
 	autotune_salts = db ? db->salts : NULL;
+
+	/* We can't process more than 4G keys per crypt() */
+	if (mask_int_cand.num_int_cand > 1)
+		gws_limit = MIN(gws_limit, 0x100000000ULL / mask_int_cand.num_int_cand / ocl_v_width);
 }
 
-/*
- * Since opencl_find_best_gws() needs more event control (even more events) to
- * work properly, opencl_find_best_workgroup() cannot be used by formats that
- * are using it.  Therefore, despite the fact that opencl_find_best_lws() does
- * almost the same that opencl_find_best_workgroup() can do, it also handles
- * the necessary event(s) and can do a proper crypt_all() execution analysis
- * when shared GWS detection is used.
- */
 void opencl_find_best_lws(size_t group_size_limit, int sequential_id,
                           cl_kernel crypt_kernel)
 {
@@ -1978,11 +1985,18 @@ void opencl_find_best_gws(int step, int max_duration,
 	}
 
 	if (have_lws) {
-		if (core_count > 2)
-			optimal_gws = lcm(core_count, optimal_gws);
+		if (core_count > 2) {
+			if (gws_limit)
+				optimal_gws = MIN(gws_limit, lcm(core_count, optimal_gws));
+			else
+				optimal_gws = lcm(core_count, optimal_gws);
+		}
 		default_value = optimal_gws;
 	} else {
-		soft_limit = local_work_size * core_count * 128;
+		if (gws_limit)
+			soft_limit = MIN(gws_limit, local_work_size * core_count * 128);
+		else
+			soft_limit = local_work_size * core_count * 128;
 	}
 
 	/* conf setting may override (decrease) code's max duration */
@@ -2028,7 +2042,7 @@ void opencl_find_best_gws(int step, int max_duration,
 				optimal_gws = num;
 
 			if (options.verbosity >= VERB_MAX)
-				fprintf(stderr, "Hardware resources exhausted\n");
+				fprintf(stderr, "Hardware resources exhausted for GWS=%zu\n", num);
 			break;
 		}
 
@@ -2386,6 +2400,21 @@ int opencl_prepare_dev(int sequential_id)
 	else
 		ocl_always_show_ws = cfg_get_bool(SECTION_OPTIONS, SUBSECTION_OPENCL,
 		                                  "AlwaysShowWorksizes", 0);
+
+#ifndef __APPLE__
+	if (gpu_nvidia(device_info[sequential_id])) {
+		opencl_avoid_busy_wait[sequential_id] = cfg_get_bool(SECTION_OPTIONS, SUBSECTION_GPU,
+		                                                     "AvoidBusyWait", 1);
+		static int warned;
+
+		/* Remove next line once (nearly) all formats has got the macros */
+		if (!opencl_avoid_busy_wait[sequential_id])
+		if (!warned) {
+			warned = 1;
+			log_event("- Busy-wait reduction %sabled", opencl_avoid_busy_wait[sequential_id] ? "en" : "dis");
+		}
+	}
+#endif
 
 	return sequential_id;
 }
@@ -3005,7 +3034,10 @@ void opencl_list_devices(void)
 			if (strstr(dname, "OpenCL 1.0")) {
 				printf(" <the minimum REQUIRED is OpenCL 1.1>");
 			}
-			printf("\n    Driver version:         %s\n",
+			clGetDeviceInfo(devices[sequence_nr], CL_DEVICE_OPENCL_C_VERSION,
+			                sizeof(dname), dname, NULL);
+			printf("\n    OpenCL version support: %s\n", dname);
+			printf("    Driver version:         %s\n",
 			       opencl_driver_info(sequence_nr));
 
 			clGetDeviceInfo(devices[sequence_nr],

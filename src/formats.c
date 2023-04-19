@@ -145,16 +145,21 @@ int fmt_match(const char *req_format, struct fmt_main *format, int override_disa
 			error();
 		}
 
-		/* Match anything before wildcard */
-		if (strncasecmp(format->params.label, req_format, (int)(pos - req_format)))
+		int pre_len = (pos - req_format);
+
+		/* Match anything before wildcard, as in office*, if applicable */
+		if (pre_len && strncasecmp(format->params.label, req_format, pre_len))
 			return 0;
 
-		/* If anything after wildcard, as in *office or raw*ng, does this also match? */
+		/* Match anything after wildcard, as in *office or raw*ng, if applicable */
 		if (*(++pos)) {
-			int wild_len = strlen(pos);
+			int trail_len = strlen(pos);
 			int label_len = strlen(format->params.label);
 
-			if (strcasecmp(&format->params.label[label_len - wild_len], pos))
+			if (label_len - pre_len < trail_len)
+				return 0;
+
+			if (strcasecmp(&format->params.label[label_len - trail_len], pos))
 				return 0;
 		}
 		return enabled;
@@ -290,7 +295,7 @@ static void comma_split(struct list_main *dst, const char *src)
 {
 	char *word, *pos;
 	char c;
-	char *src_cpy = strdup(src);
+	char *src_cpy = xstrdup(src);
 
 	strlwr(src_cpy);
 
@@ -592,6 +597,14 @@ static char* is_key_right(struct fmt_main *format, int index,
 			snprintf(err_buf, sizeof(err_buf), "cmp_all(%d) %s", match, ciphertext);
 		else
 			sprintf(err_buf, "cmp_all(%d)", match);
+		return err_buf;
+	}
+
+	if (match == 0) {
+		if (options.verbosity > VERB_LEGACY)
+			snprintf(err_buf, sizeof(err_buf), "crypt_all(%d) zero return %s", index + 1, ciphertext);
+		else
+			sprintf(err_buf, "crypt_all(%d) zero return", index + 1);
 		return err_buf;
 	}
 
@@ -980,7 +993,7 @@ static char *fmt_self_test_body(struct fmt_main *format,
 		    strcmp(format->params.label, "dummy") &&
 		    strcmp(format->params.label, "crypt")) {
 			if (*ciphertext == '$') {
-				char *p, *k = strdup(ciphertext);
+				char *p, *k = xstrdup(ciphertext);
 
 				p = k + 1;
 				while (*p) {
@@ -1314,7 +1327,7 @@ static char *fmt_self_test_body(struct fmt_main *format,
 #if defined(HAVE_OPENCL)
 /* Jump straight to last index for GPU formats but always call set_key() */
 				if (strstr(format->params.label, "-opencl")) {
-					for (i = index + 1; i < max - 1; i++)
+					for (i = index; i < max - 1; i++)
 						fmt_set_key(longcand(format, i, sl), i);
 					index = max - 1;
 				}
@@ -1453,7 +1466,7 @@ static void test_fmt_case(struct fmt_main *format, void *binary,
 	if (*plaintext == 0)
 		return;
 
-	plain_copy = strdup(plaintext);
+	plain_copy = xstrdup(plaintext);
 	pk = plain_copy;
 
 	while (*pk) {
@@ -1489,7 +1502,7 @@ static void test_fmt_8_bit(struct fmt_main *format, void *binary,
 		return;
 
 	*plaintext_is_blank = 0;
-	plain_copy = strdup(plaintext);
+	plain_copy = xstrdup(plaintext);
 
 	// All OR '\x80'
 	pk = plain_copy;
@@ -1597,7 +1610,7 @@ static void test_fmt_split_unifies_case(struct fmt_main *format, char *ciphertex
 
 	if (*is_split_unifies_case>2) return; /* already know all we need to know. */
 
-	cipher_copy = strdup(ciphertext);
+	cipher_copy = xstrdup(ciphertext);
 
 	/*
 	 * check for common case problem.  hash is HEX, so find it, change it,
@@ -1611,7 +1624,7 @@ static void test_fmt_split_unifies_case(struct fmt_main *format, char *ciphertex
 		char *cp;
 		int do_test=0;
 		ret = format->methods.split(ret, 0, format);
-		ret_copy = strdup(ret);
+		ret_copy = xstrdup(ret);
 		bin = format->methods.binary(ret_copy);
 		if (BLOB_SIZE(format, bin) > 4) {
 			bin_hex = mem_alloc(BLOB_SIZE(format, bin) * 2 + 1);
@@ -1771,7 +1784,7 @@ static void test_fmt_split_unifies_case_3(struct fmt_main *format,
 	void *orig_binary, *orig_salt;
 	void *binary, *salt;
 
-	cipher_copy = strdup(ciphertext);
+	cipher_copy = xstrdup(ciphertext);
 	split_ret = format->methods.split(cipher_copy, 0, format);
 
 	orig_binary = NULL;
@@ -1892,7 +1905,7 @@ static void test_fmt_split_unifies_case_4(struct fmt_main *format, char *ciphert
 
 	if (*is_split_unifies_case>2) return; /* already know all we need to know. */
 
-	cipher_copy = strdup(ciphertext);
+	cipher_copy = xstrdup(ciphertext);
 
 	/*
 	 * check for common case problem, but in a 'generic' manner. Here, we find sets of
@@ -1908,7 +1921,7 @@ static void test_fmt_split_unifies_case_4(struct fmt_main *format, char *ciphert
 	if (format->methods.valid(ret, format)) {
 		char *cp;
 		ret = format->methods.split(ret, 0, format);
-		ret_copy = strdup(ret);
+		ret_copy = xstrdup(ret);
 		// Ok, now walk the string, LOOKING for hex string or known lengths which are all 1 case, and NOT pure numeric
 		cp = ret_copy;
 		while (strlen(cp) > 16) {
@@ -1939,7 +1952,7 @@ static void test_fmt_split_unifies_case_4(struct fmt_main *format, char *ciphert
 						good = 1;
 					if (!good) {
 						// white list.
-						if (!strncmp(ret, "@dynamic=", 9) ||
+						if (!strncmp(ret, "@dynamic=", 9) || strstr(ret, "$HEX$") ||
 						    (ret[0]=='$'&&ret[1]=='2'&&ret[3]=='$'&& (ret[2]=='a'||ret[2]=='b'||ret[2]=='x'||ret[2]=='y') ) )
 						{
 						} else
